@@ -169,6 +169,85 @@ class Overlapy:
         return matches
 
 
+class OverlapFinder:
+    def __init__(self, testsets: list, trainingset: Iterable, n_workers=cpu_count()):
+        """
+        Initializes the OverlapFinder with testsets and trainingset.
+
+        :param testsets: List of OverlapyTestSet instances.
+        :param trainingset: The training dataset as an iterable of examples.
+        :param n_workers: Number of workers to use for parallel processing.
+        """
+        self.trainingset = trainingset
+        self.testsets = testsets
+        self.testset_ngrams = set(
+            map(tuple, chain(*[list(testset.ngrams()) for testset in testsets]))
+        )
+        self.n_workers = n_workers
+
+    def _calculate_chunk_matches(self, args):
+        """
+        Calculates matches between testset ngrams and a chunk of the training set.
+
+        :param args: A tuple containing (list of indices, worker number).
+        :return: A dictionary of matches where keys are n-grams, and values are list of training set indices.
+        """
+        matches = collections.defaultdict(list)
+        idxs, n_worker = args
+        matcher = OverlapyNgramMatcher(self.testset_ngrams)
+
+        for idx in tqdm(
+            idxs, total=len(idxs), position=n_worker + 1, desc=f"Worker #{n_worker}"
+        ):
+            matched = matcher([self.trainingset[idx]])
+            for ngram, positions in matched.items():
+                matches[ngram].extend([idx] * len(positions))  # Store matching training indices
+        return matches
+
+    def find_overlaps(self):
+        """
+        Finds overlaps between the testsets and the trainingset.
+
+        :return: A dictionary where keys are testset example indices, and values are lists of training set example indices that overlap.
+        """
+        pool = Pool(self.n_workers)
+        matches = collections.defaultdict(list)
+
+        # Perform parallel processing to find n-gram matches in the training set
+        for d in tqdm(
+            pool.imap_unordered(
+                self._calculate_chunk_matches,
+                zip(
+                    list_split(list(range(len(self.trainingset))), self.n_workers),
+                    list(range(self.n_workers)),
+                ),
+            ),
+            total=self.n_workers,
+            position=0,
+            desc="Global progress",
+        ):
+            for ngram, training_indices in d.items():
+                matches[ngram].extend(training_indices)
+
+        pool.close()
+        pool.join()
+
+        # Now find which testset examples the matched n-grams belong to
+        overlaps = collections.defaultdict(list)
+        for testset_idx, testset in enumerate(self.testsets):
+            ac = AhoCorasick(matches.keys())  # Initialize AhoCorasick matcher with training n-grams
+            for i, example in enumerate(testset.examples):
+                for ngram, _ in ac(example):
+                    # For each testset example that matches, store the matching training set indices
+                    overlaps[i].extend(matches[ngram])
+
+        # Remove duplicate matches for each testset example
+        overlaps = {k: list(set(v)) for k, v in overlaps.items()}
+
+        return overlaps
+
+
+
 def list_split(lst, sections):
     """
     Splits a list into N sections. From https://stackoverflow.com/a/2135920.
@@ -185,3 +264,47 @@ def list_split(lst, sections):
     return [
         lst[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(sections)
     ]
+
+
+if __name__ == "__main__":
+    # Example of how to use the OverlapFinder:
+
+
+    pretraining_dataset = [
+        "A B A C D E F G",
+        "A C F J K H E",
+        "V L N M Q",
+        "A B A C Ç T Z V E",
+        "L M N O P",
+    ]
+
+    testset_examples = [
+        "B A B A C O Q W R",  # Match A B A C with #1, #4 from pretraining_dataset
+        "O P Q F J K H",  # Match F J K H with #2 from pretraining_dataset
+        "W E R E",  # No match
+        "I E T Z V E L",  # Match T Z V E with #4 from pretraining_dataset
+        "K E K W",  # No match
+    ]
+    # Total examples matched: 3
+
+
+    def tokenizer(s):
+        # Simple tokenization by whitespace.
+        return s.split()
+    
+    testset = OverlapyTestSet(
+        "test", min_n=1, examples=[tokenizer(s) for s in testset_examples]
+    )
+
+    # testsets = [OverlapyTestSet(...), OverlapyTestSet(...)]
+    # trainingset = [...]
+
+    overlap_finder = OverlapFinder(
+        [testset], 
+        [tokenizer(s) for s in pretraining_dataset]
+    )
+    overlaps = overlap_finder.find_overlaps()
+
+    # Print the overlaps
+    for testset_idx, training_indices in overlaps.items():
+        print(f"Testset example {testset_idx} overlaps with training set examples: {training_indices}")
